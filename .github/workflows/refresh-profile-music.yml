@@ -1,0 +1,53 @@
+name: Refresh Profile Music MQTT
+
+on:
+  schedule:
+    # 毎時0分
+    - cron: "0 * * * *"
+
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ------------------------------------------------------
+      # リポジトリ取得
+      # ------------------------------------------------------
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------
+      # Python
+      # ------------------------------------------------------
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ------------------------------------------------------
+      # 必要ライブラリ
+      # ------------------------------------------------------
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "psycopg[binary]" "paho-mqtt"
+
+      # ------------------------------------------------------
+      # MQTT再保存
+      # ------------------------------------------------------
+
+      - name: Refresh MQTT profile music
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+          MQTT_HOST: broker.hivemq.com
+          MQTT_PORT: 8883
+
+        run: |
+          python refresh_profile_music.py
