@@ -56,11 +56,30 @@ MUSIC_TOPIC_PREFIX = "chanpro-post/music"
 # 最後に保存してから10時間以上経過したら対象
 REFRESH_AFTER_HOURS = 10
 
+
+# ============================================================
+# MQTT受信設定
+# ============================================================
+
 # MQTT Retain受信待ち時間
 MQTT_WAIT_SECONDS = 60
 
-# MQTT Publish完了待ち
-MQTT_PUBLISH_TIMEOUT = 30
+
+# ============================================================
+# MQTT Publish設定
+# ============================================================
+
+# 1回のPublishに対するACK待ち時間
+MQTT_PUBLISH_TIMEOUT = 60
+
+# Publishリトライ回数
+MQTT_PUBLISH_RETRIES = 5
+
+# chunk間の待機時間
+MQTT_PUBLISH_INTERVAL = 0.5
+
+# リトライ前の最大待機時間
+MQTT_RETRY_MAX_WAIT = 10
 
 
 # ============================================================
@@ -86,6 +105,7 @@ def parse_datetime(value):
     if isinstance(value, datetime):
 
         if value.tzinfo is None:
+
             return value.replace(
                 tzinfo=timezone.utc
             )
@@ -106,6 +126,7 @@ def parse_datetime(value):
         )
 
         if dt.tzinfo is None:
+
             dt = dt.replace(
                 tzinfo=timezone.utc
             )
@@ -166,6 +187,12 @@ class MQTTReceiver:
         self.connected = False
 
         self.error = None
+
+        # ----------------------------------------------------
+        # Subscribe済みTopic
+        # ----------------------------------------------------
+
+        self.subscribed_topics = set()
 
         # ----------------------------------------------------
         # Callback
@@ -249,6 +276,8 @@ class MQTTReceiver:
 
         self.connected = True
 
+        self.error = None
+
         print(
             "MQTT接続成功"
         )
@@ -265,6 +294,8 @@ class MQTTReceiver:
         reason_code,
         properties=None
     ):
+
+        self.connected = False
 
         if reason_code != 0:
 
@@ -309,6 +340,19 @@ class MQTTReceiver:
         topic
     ):
 
+        # ----------------------------------------------------
+        # 同じTopicへの重複Subscribeを防止
+        # ----------------------------------------------------
+
+        if topic in self.subscribed_topics:
+
+            print(
+                f"MQTT subscribe済み: "
+                f"{topic}"
+            )
+
+            return
+
         print(
             f"MQTT subscribe: "
             f"{topic}"
@@ -328,6 +372,10 @@ class MQTTReceiver:
                 f"MQTT subscribe失敗: "
                 f"{result}"
             )
+
+        self.subscribed_topics.add(
+            topic
+        )
 
     # ========================================================
     # 必要Topicの受信待機
@@ -450,38 +498,154 @@ class MQTTReceiver:
         payload
     ):
 
-        print(
-            f"MQTT再保存: "
-            f"{topic} "
-            f"({len(payload)} bytes)"
-        )
+        last_error = None
 
-        info = self.client.publish(
-            topic,
-            payload=payload,
-            qos=1,
-            retain=True
-        )
+        # ====================================================
+        # リトライ
+        # ====================================================
 
-        if (
-            info.rc
-            != mqtt.MQTT_ERR_SUCCESS
+        for attempt in range(
+            1,
+            MQTT_PUBLISH_RETRIES + 1
         ):
 
-            raise RuntimeError(
-                f"MQTT publish失敗: "
-                f"{topic}, "
-                f"rc={info.rc}"
+            print(
+                f"MQTT再保存: "
+                f"{topic} "
+                f"({len(payload)} bytes) "
+                f"[試行 {attempt}/{MQTT_PUBLISH_RETRIES}]"
             )
 
-        if not info.wait_for_publish(
-            timeout=MQTT_PUBLISH_TIMEOUT
-        ):
+            try:
 
-            raise TimeoutError(
-                f"MQTT publishタイムアウト: "
-                f"{topic}"
-            )
+                # --------------------------------------------
+                # MQTT接続確認
+                # --------------------------------------------
+
+                if not self.connected:
+
+                    raise RuntimeError(
+                        "MQTT接続されていません"
+                    )
+
+                # --------------------------------------------
+                # Publish
+                # --------------------------------------------
+
+                info = self.client.publish(
+                    topic,
+                    payload=payload,
+                    qos=1,
+                    retain=True
+                )
+
+                # --------------------------------------------
+                # publish自体のエラー
+                # --------------------------------------------
+
+                if (
+                    info.rc
+                    != mqtt.MQTT_ERR_SUCCESS
+                ):
+
+                    raise RuntimeError(
+                        f"MQTT publish失敗: "
+                        f"rc={info.rc}"
+                    )
+
+                # --------------------------------------------
+                # PUBACK待ち
+                # --------------------------------------------
+
+                published = info.wait_for_publish(
+                    timeout=MQTT_PUBLISH_TIMEOUT
+                )
+
+                # --------------------------------------------
+                # 成功
+                # --------------------------------------------
+
+                if published:
+
+                    print(
+                        f"MQTT再保存成功: "
+                        f"{topic}"
+                    )
+
+                    # ----------------------------------------
+                    # 次のPublishまで少し待つ
+                    # ----------------------------------------
+
+                    if (
+                        MQTT_PUBLISH_INTERVAL
+                        > 0
+                    ):
+
+                        time.sleep(
+                            MQTT_PUBLISH_INTERVAL
+                        )
+
+                    return
+
+                # --------------------------------------------
+                # wait_for_publish timeout
+                # --------------------------------------------
+
+                raise TimeoutError(
+                    "PUBACK待機タイムアウト"
+                )
+
+            except Exception as e:
+
+                last_error = e
+
+                print(
+                    f"⚠ MQTT publish失敗: "
+                    f"{topic}"
+                )
+
+                print(
+                    f"⚠ 理由: {e}"
+                )
+
+                # --------------------------------------------
+                # 最終試行
+                # --------------------------------------------
+
+                if (
+                    attempt
+                    >= MQTT_PUBLISH_RETRIES
+                ):
+
+                    break
+
+                # --------------------------------------------
+                # リトライ待機
+                # --------------------------------------------
+
+                retry_wait = min(
+                    attempt * 2,
+                    MQTT_RETRY_MAX_WAIT
+                )
+
+                print(
+                    f"⚠ {retry_wait}秒後に再試行します"
+                )
+
+                time.sleep(
+                    retry_wait
+                )
+
+        # ====================================================
+        # 全リトライ失敗
+        # ====================================================
+
+        raise TimeoutError(
+            f"MQTT publish最終失敗: "
+            f"{topic}, "
+            f"retries={MQTT_PUBLISH_RETRIES}, "
+            f"last_error={last_error}"
+        )
 
     # ========================================================
     # MQTT切断
@@ -801,11 +965,7 @@ def download_music(
     ]
 
     # ========================================================
-    # 重要
-    #
-    # 個別にsubscribeしない
-    #
-    # 音楽1件について # を1回subscribeする
+    # ワイルドカードTopic
     # ========================================================
 
     wildcard_topic = (
@@ -824,6 +984,8 @@ def download_music(
 
     # ========================================================
     # Subscribe
+    #
+    # この音楽について1回だけsubscribeする
     # ========================================================
 
     mqtt_client.subscribe(
@@ -1019,10 +1181,13 @@ def download_music(
     )
 
     # ========================================================
-    # サイズが違っていても処理を継続
+    # サイズ不一致でも継続
     # ========================================================
 
-    if total_size != expected_size:
+    if (
+        total_size
+        != expected_size
+    ):
 
         print(
             "⚠ MQTTデータのサイズが一致しません"
@@ -1031,6 +1196,11 @@ def download_music(
         print(
             "⚠ サイズ不一致ですが、"
             "取得したデータをそのまま再保存します"
+        )
+
+        print(
+            f"⚠ サイズ差: "
+            f"{total_size - expected_size:+d} bytes"
         )
 
     else:
@@ -1054,6 +1224,8 @@ def download_music(
         "chunk_data": chunk_data,
         "chunk_topics": chunk_topics,
         "topic_prefix": topic_prefix,
+        "total_size": total_size,
+        "expected_size": expected_size,
     }
 
 
@@ -1073,6 +1245,24 @@ def refresh_music(
     print(
         "MQTT Retainを再保存します"
     )
+
+    # ========================================================
+    # サイズ情報
+    # ========================================================
+
+    print(
+        f"再保存データサイズ: "
+        f"{data['total_size']} bytes"
+    )
+
+    if (
+        data["total_size"]
+        != data["expected_size"]
+    ):
+
+        print(
+            "⚠ サイズ不一致のまま再保存します"
+        )
 
     # ========================================================
     # chunk再保存
@@ -1132,7 +1322,7 @@ def update_last_saved_at(
 ):
 
     # --------------------------------------------------------
-    # 元JSONを壊さない
+    # 元JSONをコピー
     # --------------------------------------------------------
 
     updated_music = dict(
@@ -1294,6 +1484,11 @@ def main():
         print(
             f"name: "
             f"{music.get('name')}"
+        )
+
+        print(
+            f"保存サイズ: "
+            f"{data['total_size']} bytes"
         )
 
         print(
