@@ -2,6 +2,8 @@ import os
 import json
 import time
 import ssl
+import base64
+import subprocess
 from datetime import datetime, timezone, timedelta
 
 import psycopg
@@ -38,17 +40,26 @@ MQTT_PASSWORD = os.environ.get(
 
 MUSIC_TOPIC_PREFIX = "chanpro-post/music"
 
-# この時間以上経過したデータを再保存対象にする
+# 10時間以上経過したものを再保存
 REFRESH_AFTER_HOURS = 10
 
-# MQTT Retain受信待機時間
+# MQTT受信待機
 MQTT_WAIT_SECONDS = 60
 
-# MQTT publish完了待機時間
+# MQTT publish待機
 MQTT_PUBLISH_TIMEOUT = 30
 
-# MQTT接続待機時間
+# MQTT接続待機
 MQTT_CONNECT_TIMEOUT = 20
+
+# バックアップ保存先
+BACKUP_ROOT = "backup/profile_music"
+
+# Git自動commit
+AUTO_GIT_PUSH = os.environ.get(
+    "AUTO_GIT_PUSH",
+    "1"
+) == "1"
 
 
 # ============================================================
@@ -60,20 +71,22 @@ def now_utc():
 
 
 def parse_datetime(value):
-    """
-    Supabaseから返ってくる日時文字列をdatetimeへ変換
-    """
 
     if not value:
         return None
 
     if isinstance(value, datetime):
+
         dt = value
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
 
-        return dt.astimezone(timezone.utc)
+        return dt.astimezone(
+            timezone.utc
+        )
 
     value = str(value).strip()
 
@@ -81,28 +94,36 @@ def parse_datetime(value):
         return None
 
     try:
-        # Z対応
-        if value.endswith("Z"):
-            value = value[:-1] + "+00:00"
 
-        dt = datetime.fromisoformat(value)
+        if value.endswith("Z"):
+            value = (
+                value[:-1]
+                + "+00:00"
+            )
+
+        dt = datetime.fromisoformat(
+            value
+        )
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
 
-        return dt.astimezone(timezone.utc)
+        return dt.astimezone(
+            timezone.utc
+        )
 
     except Exception:
+
         print(
             f"日時解析失敗: {value}"
         )
+
         return None
 
 
 def format_bytes(size):
-    """
-    バイト数を見やすく表示
-    """
 
     size = int(size)
 
@@ -110,9 +131,13 @@ def format_bytes(size):
         return f"{size} B"
 
     if size < 1024 * 1024:
-        return f"{size / 1024:.2f} KB"
+        return (
+            f"{size / 1024:.2f} KB"
+        )
 
-    return f"{size / 1024 / 1024:.2f} MB"
+    return (
+        f"{size / 1024 / 1024:.2f} MB"
+    )
 
 
 # ============================================================
@@ -124,37 +149,45 @@ class MQTTReceiver:
     def __init__(self):
 
         self.client = mqtt.Client(
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            callback_api_version=(
+                mqtt.CallbackAPIVersion.VERSION2
+            ),
             protocol=mqtt.MQTTv5
         )
 
         if MQTT_USERNAME:
+
             self.client.username_pw_set(
                 MQTT_USERNAME,
                 MQTT_PASSWORD
             )
 
-        # TLS
         self.client.tls_set(
             cert_reqs=ssl.CERT_REQUIRED
         )
 
-        self.client.tls_insecure_set(False)
+        self.client.tls_insecure_set(
+            False
+        )
 
         self.connected = False
-
+        self.connection_error = None
         self.messages = {}
 
-        self.connection_error = None
+        self.client.on_connect = (
+            self.on_connect
+        )
 
-        self.disconnect_event = False
+        self.client.on_message = (
+            self.on_message
+        )
 
-        self.client.on_connect = self.on_connect
-        self.client.on_message = self.on_message
-        self.client.on_disconnect = self.on_disconnect
+        self.client.on_disconnect = (
+            self.on_disconnect
+        )
 
     # --------------------------------------------------------
-    # 接続
+    # connect callback
     # --------------------------------------------------------
 
     def on_connect(
@@ -167,6 +200,7 @@ class MQTTReceiver:
     ):
 
         if reason_code == 0:
+
             self.connected = True
             self.connection_error = None
 
@@ -175,8 +209,10 @@ class MQTTReceiver:
             )
 
         else:
+
             self.connection_error = (
-                f"MQTT接続失敗: {reason_code}"
+                f"MQTT接続失敗: "
+                f"{reason_code}"
             )
 
             print(
@@ -184,7 +220,7 @@ class MQTTReceiver:
             )
 
     # --------------------------------------------------------
-    # メッセージ
+    # message callback
     # --------------------------------------------------------
 
     def on_message(
@@ -195,19 +231,23 @@ class MQTTReceiver:
     ):
 
         topic = msg.topic
-        payload = bytes(msg.payload)
 
-        # 同じtopicが複数回届いた場合も
-        # 最新データを保持
-        self.messages[topic] = payload
+        payload = bytes(
+            msg.payload
+        )
+
+        self.messages[
+            topic
+        ] = payload
 
         print(
-            f"MQTT受信: {topic} "
+            f"MQTT受信: "
+            f"{topic} "
             f"({len(payload)} bytes)"
         )
 
     # --------------------------------------------------------
-    # 切断
+    # disconnect callback
     # --------------------------------------------------------
 
     def on_disconnect(
@@ -224,11 +264,12 @@ class MQTTReceiver:
         if reason_code != 0:
 
             print(
-                f"MQTT切断: reason_code={reason_code}"
+                f"MQTT切断: "
+                f"reason_code={reason_code}"
             )
 
     # --------------------------------------------------------
-    # 接続開始
+    # connect
     # --------------------------------------------------------
 
     def connect(self):
@@ -251,14 +292,17 @@ class MQTTReceiver:
         while not self.connected:
 
             if self.connection_error:
+
                 raise RuntimeError(
                     self.connection_error
                 )
 
             if (
-                time.monotonic() - start
+                time.monotonic()
+                - start
                 > MQTT_CONNECT_TIMEOUT
             ):
+
                 raise TimeoutError(
                     "MQTT接続タイムアウト"
                 )
@@ -266,12 +310,13 @@ class MQTTReceiver:
             time.sleep(0.1)
 
     # --------------------------------------------------------
-    # Subscribe
+    # subscribe
     # --------------------------------------------------------
 
     def subscribe(self, topic):
 
         if not self.connected:
+
             raise RuntimeError(
                 "MQTT未接続です"
             )
@@ -285,15 +330,18 @@ class MQTTReceiver:
             qos=1
         )
 
-        if result[0] != mqtt.MQTT_ERR_SUCCESS:
+        if (
+            result[0]
+            != mqtt.MQTT_ERR_SUCCESS
+        ):
 
             raise RuntimeError(
-                "MQTT subscribe失敗: "
+                f"MQTT subscribe失敗: "
                 f"{result}"
             )
 
     # --------------------------------------------------------
-    # 必要topic受信待ち
+    # wait topics
     # --------------------------------------------------------
 
     def wait_for_topics(
@@ -302,7 +350,7 @@ class MQTTReceiver:
         timeout
     ):
 
-        expected_topics = set(
+        expected = set(
             expected_topics
         )
 
@@ -313,15 +361,16 @@ class MQTTReceiver:
         while True:
 
             received = (
-                expected_topics
+                expected
                 & set(self.messages.keys())
             )
 
             count = len(received)
-            total = len(expected_topics)
+            total = len(expected)
 
             elapsed = int(
-                time.monotonic() - start
+                time.monotonic()
+                - start
             )
 
             if count >= total:
@@ -333,7 +382,10 @@ class MQTTReceiver:
 
                 return True
 
-            if elapsed - last_report >= 5:
+            if (
+                elapsed - last_report
+                >= 5
+            ):
 
                 print(
                     f"MQTT受信待機中: "
@@ -346,7 +398,7 @@ class MQTTReceiver:
             if elapsed >= timeout:
 
                 missing = (
-                    expected_topics
+                    expected
                     - set(self.messages.keys())
                 )
 
@@ -355,7 +407,8 @@ class MQTTReceiver:
                 )
 
                 print(
-                    f"受信: {count}/{total}"
+                    f"受信: "
+                    f"{count}/{total}"
                 )
 
                 print(
@@ -363,7 +416,10 @@ class MQTTReceiver:
                     f"{len(missing)}件"
                 )
 
-                for topic in sorted(missing):
+                for topic in sorted(
+                    missing
+                ):
+
                     print(
                         f"  未取得: {topic}"
                     )
@@ -373,7 +429,7 @@ class MQTTReceiver:
             time.sleep(0.1)
 
     # --------------------------------------------------------
-    # Retain publish
+    # publish retain
     # --------------------------------------------------------
 
     def publish_retain(
@@ -383,6 +439,7 @@ class MQTTReceiver:
     ):
 
         if not self.connected:
+
             raise RuntimeError(
                 "MQTT未接続です"
             )
@@ -400,24 +457,19 @@ class MQTTReceiver:
             retain=True
         )
 
-        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        if (
+            result.rc
+            != mqtt.MQTT_ERR_SUCCESS
+        ):
 
             raise RuntimeError(
-                "MQTT publish失敗: "
+                f"MQTT publish失敗: "
                 f"{result.rc}"
             )
 
-        try:
-
-            result.wait_for_publish(
-                timeout=MQTT_PUBLISH_TIMEOUT
-            )
-
-        except Exception as e:
-
-            raise RuntimeError(
-                f"MQTT publish待機失敗: {e}"
-            )
+        result.wait_for_publish(
+            timeout=MQTT_PUBLISH_TIMEOUT
+        )
 
         if not result.is_published():
 
@@ -426,7 +478,7 @@ class MQTTReceiver:
             )
 
     # --------------------------------------------------------
-    # 終了
+    # close
     # --------------------------------------------------------
 
     def close(self):
@@ -455,7 +507,7 @@ class MQTTReceiver:
 
 
 # ============================================================
-# Supabaseから最も古いプロフィール音楽を取得
+# Supabaseから対象取得
 # ============================================================
 
 def get_oldest_music():
@@ -494,10 +546,13 @@ def get_oldest_music():
         if not profile_music:
             continue
 
-        # JSON文字列の場合
-        if isinstance(profile_music, str):
+        if isinstance(
+            profile_music,
+            str
+        ):
 
             try:
+
                 music = json.loads(
                     profile_music
                 )
@@ -516,14 +571,11 @@ def get_oldest_music():
             dict
         ):
 
-            music = profile_music.copy()
+            music = dict(
+                profile_music
+            )
 
         else:
-
-            print(
-                f"profile_music形式不正: "
-                f"user_id={user_id}"
-            )
 
             continue
 
@@ -532,32 +584,26 @@ def get_oldest_music():
         )
 
         if not music_id:
-
             continue
 
         created_at = parse_datetime(
-            music.get("created_at")
+            music.get(
+                "created_at"
+            )
         )
 
         last_saved_at = parse_datetime(
-            music.get("last_saved_at")
+            music.get(
+                "last_saved_at"
+            )
         )
 
-        # last_saved_atがあればそれを基準
-        # なければcreated_at
         base_time = (
             last_saved_at
             or created_at
         )
 
         if not base_time:
-
-            print(
-                f"日時情報なし: "
-                f"user_id={user_id}, "
-                f"music_id={music_id}"
-            )
-
             continue
 
         age = now - base_time
@@ -568,10 +614,12 @@ def get_oldest_music():
 
             candidates.append(
                 {
-                    "user_id": str(user_id),
+                    "user_id": str(
+                        user_id
+                    ),
                     "music": music,
                     "base_time": base_time,
-                    "age": age,
+                    "age": age
                 }
             )
 
@@ -583,7 +631,6 @@ def get_oldest_music():
 
         return None
 
-    # 最も古いもの
     candidates.sort(
         key=lambda x: x["base_time"]
     )
@@ -625,7 +672,7 @@ def get_oldest_music():
 
 
 # ============================================================
-# MQTTからプロフィール音楽を取得
+# MQTTから取得
 # ============================================================
 
 def download_music(
@@ -644,20 +691,12 @@ def download_music(
             "music_idがありません"
         )
 
-    try:
-
-        chunks = int(
-            music.get(
-                "chunks",
-                0
-            )
+    chunks = int(
+        music.get(
+            "chunks",
+            0
         )
-
-    except Exception:
-
-        raise RuntimeError(
-            "chunksが不正です"
-        )
+    )
 
     if chunks <= 0:
 
@@ -691,7 +730,7 @@ def download_music(
     ]
 
     # --------------------------------------------------------
-    # ワイルドカード1回だけsubscribe
+    # ワイルドカード購読
     # --------------------------------------------------------
 
     wildcard_topic = (
@@ -703,7 +742,7 @@ def download_music(
     )
 
     # --------------------------------------------------------
-    # Retain受信待ち
+    # Retain受信
     # --------------------------------------------------------
 
     success = mqtt_client.wait_for_topics(
@@ -713,60 +752,18 @@ def download_music(
 
     if not success:
 
-        print(
-            "必要なMQTTデータを取得できませんでした"
-        )
-
-        if meta_topic in mqtt_client.messages:
-
-            print(
-                "meta: 取得済み"
-            )
-
-        else:
-
-            print(
-                "meta: 未取得"
-            )
-
-        missing_chunks = [
-            i
-            for i, topic in enumerate(
-                chunk_topics
-            )
-            if topic not in mqtt_client.messages
-        ]
-
-        if missing_chunks:
-
-            print(
-                "不足chunk:"
-            )
-
-            print(
-                missing_chunks
-            )
-
         raise RuntimeError(
             "MQTTの必要データを全て取得できませんでした"
         )
 
     # ========================================================
-    # meta確認
+    # meta
     # ========================================================
 
     meta_payload = (
         mqtt_client.messages[
             meta_topic
         ]
-    )
-
-    print(
-        ""
-    )
-
-    print(
-        "MQTT metadata:"
     )
 
     try:
@@ -784,6 +781,14 @@ def download_music(
         )
 
     print(
+        ""
+    )
+
+    print(
+        "MQTT metadata:"
+    )
+
+    print(
         json.dumps(
             mqtt_meta,
             ensure_ascii=False,
@@ -791,83 +796,73 @@ def download_music(
         )
     )
 
-    # --------------------------------------------------------
-    # music_id確認
-    # --------------------------------------------------------
+    # ========================================================
+    # chunk
+    # ========================================================
 
-    mqtt_music_id = mqtt_meta.get(
-        "music_id"
+    chunk_data = []
+
+    total_size = 0
+
+    for topic in chunk_topics:
+
+        if topic not in mqtt_client.messages:
+
+            raise RuntimeError(
+                f"MQTT chunk未取得: {topic}"
+            )
+
+        data = (
+            mqtt_client.messages[
+                topic
+            ]
+        )
+
+        chunk_data.append(
+            data
+        )
+
+        total_size += len(data)
+
+    # ========================================================
+    # サイズ情報
+    # ========================================================
+
+    expected_size = int(
+        music.get(
+            "size",
+            0
+        )
     )
 
-    if (
-        mqtt_music_id
-        and str(mqtt_music_id)
-        != str(music_id)
-    ):
-
-        raise RuntimeError(
-            "MQTT metaのmusic_idが一致しません"
+    mqtt_meta_size = int(
+        mqtt_meta.get(
+            "size",
+            0
         )
+    )
+
+    expected_chunks = int(
+        music.get(
+            "chunks",
+            0
+        )
+    )
+
+    mqtt_meta_chunks = int(
+        mqtt_meta.get(
+            "chunks",
+            0
+        )
+    )
+
+    actual_chunks = len(
+        chunk_data
+    )
 
     # ========================================================
-    # Supabase metadata
+    # 診断
     # ========================================================
-
-    try:
-
-        expected_size = int(
-            music.get(
-                "size",
-                0
-            )
-        )
-
-    except Exception:
-
-        expected_size = 0
-
-    try:
-
-        expected_chunks = int(
-            music.get(
-                "chunks",
-                0
-            )
-        )
-
-    except Exception:
-
-        expected_chunks = 0
-
-    # ========================================================
-    # MQTT metaのsize/chunks
-    # ========================================================
-
-    try:
-
-        mqtt_meta_size = int(
-            mqtt_meta.get(
-                "size",
-                0
-            )
-        )
-
-    except Exception:
-
-        mqtt_meta_size = 0
-
-    try:
-
-        mqtt_meta_chunks = int(
-            mqtt_meta.get(
-                "chunks",
-                0
-            )
-        )
-
-    except Exception:
-
-        mqtt_meta_chunks = 0
 
     print(
         ""
@@ -890,6 +885,12 @@ def download_music(
     )
 
     print(
+        f"  MQTT chunk total  = "
+        f"{total_size} bytes "
+        f"({format_bytes(total_size)})"
+    )
+
+    print(
         f"  Supabase chunks   = "
         f"{expected_chunks}"
     )
@@ -899,177 +900,44 @@ def download_music(
         f"{mqtt_meta_chunks}"
     )
 
-    # ========================================================
-    # chunk取得
-    # ========================================================
-
-    chunk_data = []
-
-    total_size = 0
-
-    for i, topic in enumerate(
-        chunk_topics
-    ):
-
-        if topic not in mqtt_client.messages:
-
-            raise RuntimeError(
-                f"chunk/{i}がありません"
-            )
-
-        data = (
-            mqtt_client.messages[
-                topic
-            ]
-        )
-
-        chunk_data.append(
-            data
-        )
-
-        total_size += len(data)
-
-    # ========================================================
-    # chunk数
-    # ========================================================
-
-    actual_chunks = len(
-        chunk_data
-    )
-
     print(
-        ""
-    )
-
-    print(
-        f"MQTT chunk数: "
+        f"  Actual chunks     = "
         f"{actual_chunks}"
     )
 
     # ========================================================
-    # 実サイズ
+    # サイズ不一致フラグ
     # ========================================================
 
-    print(
-        f"MQTT chunk合計サイズ: "
-        f"{total_size} bytes "
-        f"({format_bytes(total_size)})"
-    )
-
-    # ========================================================
-    # 最終診断
-    # ========================================================
-
-    print(
-        ""
-    )
-
-    print(
-        "============================================================"
-    )
-
-    print(
-        "プロフィール音楽サイズ診断"
-    )
-
-    print(
-        "============================================================"
-    )
-
-    print(
-        f"Supabase size     : "
-        f"{expected_size}"
-    )
-
-    print(
-        f"MQTT meta size    : "
-        f"{mqtt_meta_size}"
-    )
-
-    print(
-        f"MQTT chunks total : "
-        f"{total_size}"
-    )
-
-    print(
-        f"Supabase chunks   : "
-        f"{expected_chunks}"
-    )
-
-    print(
-        f"MQTT meta chunks  : "
-        f"{mqtt_meta_chunks}"
-    )
-
-    print(
-        f"Actual chunks     : "
-        f"{actual_chunks}"
-    )
-
-    print(
-        "============================================================"
-    )
-
-    # ========================================================
-    # chunk数チェック
-    # ========================================================
-
-    if (
-        expected_chunks > 0
-        and actual_chunks != expected_chunks
-    ):
-
-        raise RuntimeError(
-            "MQTTチャンク数が一致しません"
-        )
-
-    if (
-        mqtt_meta_chunks > 0
-        and actual_chunks != mqtt_meta_chunks
-    ):
-
-        raise RuntimeError(
-            "MQTT metaのチャンク数と実データが一致しません"
-        )
-
-    # ========================================================
-    # MQTT meta sizeチェック
-    # ========================================================
-
-    if (
-        mqtt_meta_size > 0
-        and total_size != mqtt_meta_size
-    ):
-
-        print(
-            ""
-        )
-
-        print(
-            "MQTT metaとchunkのサイズが不一致です"
-        )
-
-        print(
-            f"MQTT meta size = "
-            f"{mqtt_meta_size}"
-        )
-
-        print(
-            f"chunk total    = "
-            f"{total_size}"
-        )
-
-        raise RuntimeError(
-            "MQTT metaとチャンクのサイズが一致しません"
-        )
-
-    # ========================================================
-    # Supabase sizeチェック
-    # ========================================================
-
-    if (
+    size_mismatch = (
         expected_size > 0
         and total_size != expected_size
+    )
+
+    meta_size_mismatch = (
+        mqtt_meta_size > 0
+        and total_size != mqtt_meta_size
+    )
+
+    chunk_mismatch = (
+        expected_chunks > 0
+        and actual_chunks != expected_chunks
+    )
+
+    meta_chunk_mismatch = (
+        mqtt_meta_chunks > 0
+        and actual_chunks != mqtt_meta_chunks
+    )
+
+    # ========================================================
+    # 不一致は警告のみ
+    # ========================================================
+
+    if (
+        size_mismatch
+        or meta_size_mismatch
+        or chunk_mismatch
+        or meta_chunk_mismatch
     ):
 
         print(
@@ -1077,52 +945,394 @@ def download_music(
         )
 
         print(
-            "Supabase metadataとMQTTデータのサイズが不一致です"
+            "============================================================"
         )
 
         print(
-            f"Supabase size = "
-            f"{expected_size}"
+            "MQTTデータにサイズまたはチャンク数の不一致があります"
+        )
+
+        if size_mismatch:
+
+            print(
+                "・Supabase size と MQTT chunk total が不一致"
+            )
+
+        if meta_size_mismatch:
+
+            print(
+                "・MQTT meta size と MQTT chunk total が不一致"
+            )
+
+        if chunk_mismatch:
+
+            print(
+                "・Supabase chunks と実際のchunk数が不一致"
+            )
+
+        if meta_chunk_mismatch:
+
+            print(
+                "・MQTT meta chunks と実際のchunk数が不一致"
+            )
+
+        print(
+            ""
         )
 
         print(
-            f"MQTT size     = "
-            f"{total_size}"
+            "取得できたMQTTデータをバックアップし、"
+            "強制的に再保存します"
         )
 
-        raise RuntimeError(
-            "MQTTデータのサイズが一致しません"
+        print(
+            "============================================================"
         )
 
-    # ========================================================
-    # 全データOK
-    # ========================================================
+    else:
 
-    print(
-        ""
-    )
+        print(
+            ""
+        )
 
-    print(
-        "MQTTデータサイズ確認OK"
-    )
-
-    print(
-        f"取得サイズ: "
-        f"{total_size} bytes"
-    )
-
-    print(
-        f"想定サイズ: "
-        f"{expected_size} bytes"
-    )
+        print(
+            "MQTTデータサイズ確認OK"
+        )
 
     return {
         "meta_topic": meta_topic,
         "meta_payload": meta_payload,
+        "mqtt_meta": mqtt_meta,
         "chunk_topics": chunk_topics,
         "chunk_data": chunk_data,
         "total_size": total_size,
+        "expected_size": expected_size,
+        "mqtt_meta_size": mqtt_meta_size,
+        "expected_chunks": expected_chunks,
+        "mqtt_meta_chunks": mqtt_meta_chunks,
+        "actual_chunks": actual_chunks,
+        "size_mismatch": size_mismatch,
+        "meta_size_mismatch": meta_size_mismatch,
+        "chunk_mismatch": chunk_mismatch,
+        "meta_chunk_mismatch": meta_chunk_mismatch
     }
+
+
+# ============================================================
+# バックアップ作成
+# ============================================================
+
+def create_backup(
+    user_id,
+    music,
+    data
+):
+
+    music_id = music.get(
+        "music_id"
+    )
+
+    timestamp = now_utc().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    backup_dir = os.path.join(
+        BACKUP_ROOT,
+        str(user_id),
+        str(music_id),
+        timestamp
+    )
+
+    os.makedirs(
+        backup_dir,
+        exist_ok=True
+    )
+
+    print(
+        ""
+    )
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        "バックアップ作成"
+    )
+
+    print(
+        f"保存先: {backup_dir}"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    # ========================================================
+    # metadata backup
+    # ========================================================
+
+    backup_info = {
+        "backup_created_at":
+            now_utc().isoformat(),
+
+        "user_id":
+            str(user_id),
+
+        "music_id":
+            music_id,
+
+        "name":
+            music.get("name", ""),
+
+        "supabase_metadata":
+            music,
+
+        "mqtt_metadata":
+            data["mqtt_meta"],
+
+        "supabase_size":
+            data["expected_size"],
+
+        "mqtt_meta_size":
+            data["mqtt_meta_size"],
+
+        "mqtt_chunk_total_size":
+            data["total_size"],
+
+        "supabase_chunks":
+            data["expected_chunks"],
+
+        "mqtt_meta_chunks":
+            data["mqtt_meta_chunks"],
+
+        "actual_chunks":
+            data["actual_chunks"],
+
+        "size_mismatch":
+            data["size_mismatch"],
+
+        "meta_size_mismatch":
+            data["meta_size_mismatch"],
+
+        "chunk_mismatch":
+            data["chunk_mismatch"],
+
+        "meta_chunk_mismatch":
+            data["meta_chunk_mismatch"]
+    }
+
+    info_path = os.path.join(
+        backup_dir,
+        "backup_info.json"
+    )
+
+    with open(
+        info_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            backup_info,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    # ========================================================
+    # MQTT meta backup
+    # ========================================================
+
+    meta_path = os.path.join(
+        backup_dir,
+        "meta.json"
+    )
+
+    with open(
+        meta_path,
+        "wb"
+    ) as f:
+
+        f.write(
+            data["meta_payload"]
+        )
+
+    # ========================================================
+    # chunk backup
+    # ========================================================
+
+    chunk_dir = os.path.join(
+        backup_dir,
+        "chunks"
+    )
+
+    os.makedirs(
+        chunk_dir,
+        exist_ok=True
+    )
+
+    for index, payload in enumerate(
+        data["chunk_data"]
+    ):
+
+        path = os.path.join(
+            chunk_dir,
+            f"chunk_{index:04d}.bin"
+        )
+
+        with open(
+            path,
+            "wb"
+        ) as f:
+
+            f.write(payload)
+
+    print(
+        "バックアップ完了"
+    )
+
+    print(
+        f"  metadata: {info_path}"
+    )
+
+    print(
+        f"  meta    : {meta_path}"
+    )
+
+    print(
+        f"  chunks  : "
+        f"{len(data['chunk_data'])}"
+    )
+
+    print(
+        f"  size    : "
+        f"{format_bytes(data['total_size'])}"
+    )
+
+    return backup_dir
+
+
+# ============================================================
+# Gitへバックアップを保存
+# ============================================================
+
+def git_commit_backup(
+    backup_dir,
+    user_id,
+    music
+):
+
+    if not AUTO_GIT_PUSH:
+
+        print(
+            "AUTO_GIT_PUSH=0 のため"
+            "Git保存をスキップします"
+        )
+
+        return
+
+    print(
+        ""
+    )
+
+    print(
+        "Gitへバックアップを保存します"
+    )
+
+    try:
+
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "user.name",
+                "github-actions[bot]"
+            ],
+            check=True
+        )
+
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "user.email",
+                "41898282+github-actions[bot]@users.noreply.github.com"
+            ],
+            check=True
+        )
+
+        subprocess.run(
+            [
+                "git",
+                "add",
+                backup_dir
+            ],
+            check=True
+        )
+
+        result = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain"
+            ],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        if not result.stdout.strip():
+
+            print(
+                "Gitに保存する変更はありません"
+            )
+
+            return
+
+        music_name = music.get(
+            "name",
+            "profile music"
+        )
+
+        commit_message = (
+            "backup profile music: "
+            f"{music_name}"
+        )
+
+        subprocess.run(
+            [
+                "git",
+                "commit",
+                "-m",
+                commit_message
+            ],
+            check=True
+        )
+
+        subprocess.run(
+            [
+                "git",
+                "push"
+            ],
+            check=True
+        )
+
+        print(
+            "Gitへのバックアップ保存完了"
+        )
+
+    except Exception as e:
+
+        print(
+            f"Gitバックアップ保存失敗: {e}"
+        )
+
+        # MQTT再保存そのものは継続できるようにする
+        print(
+            "Gitバックアップ失敗ですが"
+            "MQTT再保存は続行します"
+        )
 
 
 # ============================================================
@@ -1166,13 +1376,13 @@ def refresh_music(
         "meta_payload"
     ]
 
-    # ========================================================
-    # chunks
-    # ========================================================
-
     total = len(
         chunk_topics
     )
+
+    # ========================================================
+    # chunks
+    # ========================================================
 
     for index, (
         topic,
@@ -1305,10 +1515,6 @@ def main():
     if not target:
 
         print(
-            ""
-        )
-
-        print(
             "処理対象なし"
         )
 
@@ -1326,15 +1532,15 @@ def main():
 
     try:
 
-        # ----------------------------------------------------
+        # ====================================================
         # MQTT接続
-        # ----------------------------------------------------
+        # ====================================================
 
         mqtt_client.connect()
 
-        # ----------------------------------------------------
+        # ====================================================
         # MQTTから取得
-        # ----------------------------------------------------
+        # ====================================================
 
         data = download_music(
             mqtt_client,
@@ -1342,18 +1548,44 @@ def main():
             music
         )
 
-        # ----------------------------------------------------
-        # MQTT Retain再保存
-        # ----------------------------------------------------
+        # ====================================================
+        # 不一致なら先にバックアップ
+        # ====================================================
+
+        has_problem = (
+            data["size_mismatch"]
+            or data["meta_size_mismatch"]
+            or data["chunk_mismatch"]
+            or data["meta_chunk_mismatch"]
+        )
+
+        if has_problem:
+
+            backup_dir = create_backup(
+                user_id,
+                music,
+                data
+            )
+
+            # GitHub Actionsのpush
+            git_commit_backup(
+                backup_dir,
+                user_id,
+                music
+            )
+
+        # ====================================================
+        # MQTT Retain強制再保存
+        # ====================================================
 
         refresh_music(
             mqtt_client,
             data
         )
 
-        # ----------------------------------------------------
-        # 全処理成功後だけlast_saved_at更新
-        # ----------------------------------------------------
+        # ====================================================
+        # MQTT再保存成功
+        # ====================================================
 
         saved_at = now_utc()
 
@@ -1362,6 +1594,10 @@ def main():
             music,
             saved_at
         )
+
+        # ====================================================
+        # 完了
+        # ====================================================
 
         print(
             ""
@@ -1392,9 +1628,22 @@ def main():
         )
 
         print(
-            f"size     : "
+            f"MQTT size: "
             f"{data['total_size']} bytes"
         )
+
+        if has_problem:
+
+            print(
+                "サイズ不一致がありましたが、"
+                "バックアップ後に強制再保存しました"
+            )
+
+        else:
+
+            print(
+                "サイズ一致のため通常再保存しました"
+            )
 
         print(
             f"saved_at : "
